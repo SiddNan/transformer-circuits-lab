@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+checkpoints/
+interpretability_results/
+*.pt
+*.ckpt
+wandb/
+.env

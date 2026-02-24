@@ -1,0 +1,33 @@
+model:
+  vocab_size: 50257      # GPT-2 tokenizer vocab size
+  d_model: 256           # ~10M params — trains fast on Mac
+  n_layers: 6
+  n_heads: 4
+  n_kv_heads: 2
+  d_ff_multiplier: 2.667
+  max_seq_len: 256
+  dropout: 0.0
+  rope_theta: 10000.0
+
+training:
+  learning_rate: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  max_steps: 5000        # ~30 min on MPS, ~2 hr on CPU
+  warmup_steps: 200
+  log_interval: 10
+  eval_interval: 500
+  save_interval: 2500
+  eval_steps: 20
+  dataset_name: "roneneldan/TinyStories"
+  seq_len: 256
+  device: "mps"          # Apple Silicon GPU — change to "cpu" if Intel Mac
+  dtype: "float32"       # bfloat16 not reliable on MPS
+  compile: false         # torch.compile unstable on MPS
+  output_dir: "checkpoints/mac_quick"
+  use_wandb: false       # no account needed to start
