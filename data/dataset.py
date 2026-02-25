@@ -21,6 +21,7 @@ class TextDataset(Dataset):
     def __init__(self, data: np.ndarray, seq_len: int):
         self.seq_len = seq_len
         self.data = data
+        # how many full (seq_len + 1) chunks fit — the +1 is so we have a target for every input
         self.n_samples = (len(self.data) - 1) // seq_len
 
     def __len__(self) -> int:
@@ -30,6 +31,7 @@ class TextDataset(Dataset):
         start = idx * self.seq_len
         end = start + self.seq_len + 1
         chunk = torch.from_numpy(self.data[start:end].astype(np.int64))
+        # input is [0:seq_len], target is [1:seq_len+1] — predict the next token at each position
         return chunk[:-1], chunk[1:]
 
 
@@ -48,6 +50,7 @@ def prepare_data(
     print(f"Loading dataset: {dataset_name}")
     ds = load_dataset(dataset_name, trust_remote_code=True)
 
+    # datasets vary in what they call the text column
     text_column = None
     for col in ["text", "content", "document"]:
         if col in ds["train"].column_names:
@@ -71,13 +74,15 @@ def prepare_data(
     for i, example in enumerate(train_data):
         tokens = tokenizer.encode(example[text_column])
         all_tokens.extend(tokens)
-        all_tokens.append(eos_id)
+        all_tokens.append(eos_id)  # separate documents with EOS so the model learns boundaries
         if (i + 1) % 50000 == 0:
             print(f"  Tokenized {i + 1}/{len(train_data)} examples...")
 
+    # uint16 saves ~50% memory vs int32 — fine since GPT-2 vocab is 50257 < 65535
     all_tokens = np.array(all_tokens, dtype=np.uint16)
     print(f"Total tokens: {len(all_tokens):,}")
 
+    # shuffle at the chunk level, not the token level — keeps sequences coherent
     n_val = int(len(all_tokens) * val_fraction)
     rng = np.random.default_rng(seed)
     chunk_size = seq_len + 1

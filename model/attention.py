@@ -36,10 +36,13 @@ def precompute_rope_frequencies(
         freqs_cis: Complex tensor of shape (max_seq_len, d_head // 2)
                    containing e^(i * angle) for each position and dimension pair.
     """
+    # lower dimensions get high frequencies (change fast with position)
+    # higher dimensions get low frequencies (change slowly) — same idea as sinusoidal PE
     dim_pairs = torch.arange(0, d_head, 2, device=device, dtype=torch.float32)
     freqs = 1.0 / (theta ** (dim_pairs / d_head))
     t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
     angles = torch.outer(t, freqs)
+    # represent as complex numbers so rotation = multiplication
     freqs_cis = torch.polar(torch.ones_like(angles), angles)
     return freqs_cis
 
@@ -62,13 +65,16 @@ def apply_rope(
         Tensor with RoPE applied, same shape as input.
     """
     batch, seq_len, n_heads, d_head = x.shape
+    # pair up adjacent dimensions and treat each pair as a complex number
     x_complex = torch.view_as_complex(
         x.float().reshape(batch, seq_len, n_heads, d_head // 2, 2)
     )
+    # broadcast freqs across batch and heads
     freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
+    # multiplying complex numbers = rotating in 2D — this is the whole trick
     x_rotated = x_complex * freqs_cis
     x_out = torch.view_as_real(x_rotated).reshape(batch, seq_len, n_heads, d_head)
-    return x_out.type_as(x)
+    return x_out.type_as(x)  # cast back to original dtype
 
 
 class GroupedQueryAttention(nn.Module):
@@ -89,8 +95,9 @@ class GroupedQueryAttention(nn.Module):
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
         self.d_head = config.d_head
-        self.n_rep = self.n_heads // self.n_kv_heads
+        self.n_rep = self.n_heads // self.n_kv_heads  # how many Q heads share each KV head
 
+        # note: Q projects to full n_heads, K and V only project to n_kv_heads
         self.W_q = nn.Linear(config.d_model, config.n_heads * config.d_head, bias=False)
         self.W_k = nn.Linear(config.d_model, config.n_kv_heads * config.d_head, bias=False)
         self.W_v = nn.Linear(config.d_model, config.n_kv_heads * config.d_head, bias=False)
@@ -102,7 +109,7 @@ class GroupedQueryAttention(nn.Module):
     def _expand_kv_heads(self, x: torch.Tensor) -> torch.Tensor:
         """Repeat KV heads to match the number of query heads."""
         if self.n_rep == 1:
-            return x
+            return x  # standard MHA, nothing to expand
         batch, seq_len, n_kv_heads, d_head = x.shape
         x = x.unsqueeze(3).expand(batch, seq_len, n_kv_heads, self.n_rep, d_head)
         return x.reshape(batch, seq_len, self.n_heads, d_head)
@@ -134,29 +141,28 @@ class GroupedQueryAttention(nn.Module):
         k = self.W_k(x).view(batch, seq_len, self.n_kv_heads, self.d_head)
         v = self.W_v(x).view(batch, seq_len, self.n_kv_heads, self.d_head)
 
-        # Apply RoPE to Q and K (not V — this is important!)
+        # RoPE goes on Q and K — not V. V carries content, not position.
         q = apply_rope(q, freqs_cis)
         k = apply_rope(k, freqs_cis)
 
-        # KV-cache handling for autoregressive generation
+        # during generation: append new K,V to the cache from previous steps
         if kv_cache is not None:
             cached_k, cached_v = kv_cache
             k = torch.cat([cached_k, k], dim=1)
             v = torch.cat([cached_v, v], dim=1)
         new_kv_cache = (k, v)
 
-        # Expand KV heads for GQA
+        # now expand KV heads to match Q heads for the actual matmul
         k = self._expand_kv_heads(k)
         v = self._expand_kv_heads(v)
 
-        # Transpose for attention: (batch, n_heads, seq_len, d_head)
+        # reshape to (batch, n_heads, seq_len, d_head) for attention matmul
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Scaled dot-product attention
         if not return_attention and mask is None:
-            # Use PyTorch's optimized implementation (flash attention)
+            # fast path: use PyTorch's flash attention — fused kernel, much less memory
             output = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=None,
@@ -165,11 +171,11 @@ class GroupedQueryAttention(nn.Module):
             )
             attn_weights = None
         else:
-            # Manual attention computation (needed for interpretability)
+            # slow path: manual attention — needed when we want to inspect the weights
             scale = 1.0 / math.sqrt(self.d_head)
             attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
             if mask is not None:
-                attn_scores = attn_scores + mask
+                attn_scores = attn_scores + mask  # mask is -inf for future positions
             attn_weights = F.softmax(attn_scores, dim=-1)
             attn_weights = self.attn_dropout(attn_weights)
             output = torch.matmul(attn_weights, v)

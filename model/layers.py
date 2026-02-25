@@ -30,11 +30,11 @@ class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d_model))
+        self.weight = nn.Parameter(torch.ones(d_model))  # learned scale, initialized to 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
-        x = x.float()
+        x = x.float()  # upcast to float32 for numerical stability, then cast back
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         x = x / rms
         return (x * self.weight).to(input_dtype)
@@ -52,16 +52,17 @@ class SwiGLUFFN(nn.Module):
 
     def __init__(self, config: ModelConfig):
         super().__init__()
+        # three matrices instead of two — the gate decides how much of W_up's output passes through
         self.W_gate = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.W_up = nn.Linear(config.d_model, config.d_ff, bias=False)
         self.W_down = nn.Linear(config.d_ff, config.d_model, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = F.silu(self.W_gate(x))
-        up = self.W_up(x)
-        hidden = gate * up
-        output = self.W_down(hidden)
+        gate = F.silu(self.W_gate(x))   # smooth gating signal
+        up = self.W_up(x)               # the content to potentially pass through
+        hidden = gate * up              # element-wise: gate controls what survives
+        output = self.W_down(hidden)    # project back to d_model
         return self.dropout(output)
 
 
@@ -78,7 +79,7 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
-        self.layer_idx = layer_idx
+        self.layer_idx = layer_idx  # useful for debugging and per-layer analysis
         self.attn_norm = RMSNorm(config.d_model)
         self.attn = GroupedQueryAttention(config)
         self.ffn_norm = RMSNorm(config.d_model)
@@ -92,18 +93,18 @@ class TransformerBlock(nn.Module):
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_attention: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
-        # Pre-norm attention with residual
+        # normalize first, then attend, then add back to the residual stream
         residual = x
         x_norm = self.attn_norm(x)
         attn_out, new_kv_cache, attn_weights = self.attn(
             x_norm, freqs_cis, mask, kv_cache, return_attention
         )
-        x = residual + attn_out
+        x = residual + attn_out  # attention writes a delta onto the residual stream
 
-        # Pre-norm FFN with residual
+        # same pattern for FFN
         residual = x
         x_norm = self.ffn_norm(x)
         ffn_out = self.ffn(x_norm)
-        x = residual + ffn_out
+        x = residual + ffn_out  # FFN also writes a delta, not a replacement
 
         return x, new_kv_cache, attn_weights

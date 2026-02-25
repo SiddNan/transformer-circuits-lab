@@ -24,6 +24,7 @@ class Trainer:
         self.mc = model_config
         self.tc = train_config
 
+        # figure out the right device — respects the config but gracefully falls back
         device_str = train_config.device
         if device_str == "cuda" and not torch.cuda.is_available():
             device_str = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -38,6 +39,7 @@ class Trainer:
             self.compute_dtype = torch.float16
             train_config.dtype = "float16"
 
+        # GradScaler is only needed for float16 — bfloat16 doesn't underflow the same way
         self.use_scaler = (self.compute_dtype == torch.float16)
         self.scaler = GradScaler("cuda", enabled=self.use_scaler)
         print(f"Device: {self.device} | Compute dtype: {self.compute_dtype}")
@@ -64,6 +66,8 @@ class Trainer:
                 print("wandb not installed, skipping logging")
 
     def _create_optimizer(self) -> torch.optim.AdamW:
+        # weight decay should only apply to weight matrices, not biases or norms
+        # applying it to norms and biases doesn't help and can hurt
         decay_params, nodecay_params = [], []
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
@@ -85,7 +89,7 @@ class Trainer:
             lr=self.tc.learning_rate,
             betas=(self.tc.beta1, self.tc.beta2),
             eps=self.tc.eps,
-            fused=torch.cuda.is_available(),
+            fused=torch.cuda.is_available(),  # fused kernel is faster on CUDA
         )
 
     @torch.no_grad()
@@ -94,7 +98,7 @@ class Trainer:
         total_loss, n_batches = 0.0, 0
         for i, (input_ids, targets) in enumerate(val_loader):
             if i >= self.tc.eval_steps:
-                break
+                break  # don't evaluate the whole val set every time — just a sample
             input_ids, targets = input_ids.to(self.device), targets.to(self.device)
             with autocast(device_type="cuda", dtype=self.compute_dtype, enabled=self.device.type == "cuda"):
                 result = self.model(input_ids, targets=targets)
@@ -147,24 +151,28 @@ class Trainer:
         t_start = time.time()
 
         while step < self.tc.max_steps:
+            # update LR every step — cosine schedule is computed on the fly
             lr = get_lr(step, self.tc.learning_rate, self.tc.min_lr,
                        self.tc.warmup_steps, self.tc.max_steps)
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
 
-            self.optimizer.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad(set_to_none=True)  # set_to_none is slightly faster than zero
             accum_loss = 0.0
 
+            # gradient accumulation: run N micro-batches, average the gradients
             for _ in range(self.tc.gradient_accumulation_steps):
                 input_ids, targets = next(train_iter)
                 input_ids, targets = input_ids.to(self.device), targets.to(self.device)
                 with autocast(device_type="cuda", dtype=self.compute_dtype, enabled=self.device.type == "cuda"):
                     result = self.model(input_ids, targets=targets)
+                    # divide loss before backward so gradients are already averaged
                     loss = result["loss"] / self.tc.gradient_accumulation_steps
                 accum_loss += loss.item()
                 self.scaler.scale(loss).backward()
                 tokens_processed += input_ids.numel()
 
+            # clip gradients before the optimizer step — prevents any single update from being huge
             if self.tc.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.tc.grad_clip)

@@ -39,10 +39,13 @@ class Transformer(nn.Module):
         self.final_norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        # Weight tying
+        # weight tying: the token embedding matrix and the LM head share the same weights.
+        # logically consistent — both map between token space and model space.
+        # also saves ~vocab_size * d_model parameters (50k * 512 = 26M for a 50M model).
         self.lm_head.weight = self.tok_emb.weight
 
-        # Precompute RoPE frequencies (not learned parameters)
+        # precompute RoPE frequencies once at init — shape: (max_seq_len * 2, d_head // 2)
+        # stored as a buffer so it moves to the right device with .to() but isn't a parameter
         freqs_cis = precompute_rope_frequencies(
             config.d_head, config.max_seq_len * 2, config.rope_theta
         )
@@ -50,7 +53,9 @@ class Transformer(nn.Module):
 
         self._init_weights()
 
-        # Scale residual projections by 1/sqrt(2*n_layers) for stability
+        # scale down the output projections of attention and FFN by 1/sqrt(2*n_layers).
+        # without this, the residual stream variance grows linearly with depth at init,
+        # which can cause instability early in training.
         for layer in self.layers:
             scale = 1.0 / math.sqrt(2.0 * config.n_layers)
             with torch.no_grad():
@@ -63,6 +68,7 @@ class Transformer(nn.Module):
         std = self.config.init_std
         for module in self.modules():
             if isinstance(module, nn.Linear):
+                # truncated normal keeps weights close to zero — avoids extreme values at init
                 torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-3*std, b=3*std)
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
@@ -72,7 +78,7 @@ class Transformer(nn.Module):
     @property
     def n_params(self) -> int:
         n = sum(p.numel() for p in self.parameters())
-        n -= self.lm_head.weight.numel()  # Tied weights
+        n -= self.lm_head.weight.numel()  # don't double-count tied weights
         return n
 
     def forward(
@@ -81,8 +87,8 @@ class Transformer(nn.Module):
         targets: Optional[torch.Tensor] = None,
         kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         start_pos: int = 0,
-        return_hidden_states: bool = False,
-        return_attention: bool = False,
+        return_hidden_states: bool = False,  # set True to get residual stream at each layer
+        return_attention: bool = False,       # set True to get attention weights (triggers slow path)
     ) -> Dict[str, torch.Tensor]:
         batch, seq_len = input_ids.shape
         device = input_ids.device
@@ -90,11 +96,14 @@ class Transformer(nn.Module):
         x = self.tok_emb(input_ids)
         x = self.emb_dropout(x)
 
+        # slice the precomputed RoPE frequencies for this sequence's positions
         if kv_cache is not None and start_pos > 0:
             freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len]
         else:
             freqs_cis = self.freqs_cis[:seq_len]
 
+        # only build the causal mask explicitly when we need attention weights;
+        # flash attention handles masking internally in the fast path
         mask = None
         if return_attention:
             total_len = seq_len + (kv_cache[0][0].shape[1] if kv_cache and kv_cache[0] is not None else 0)
@@ -106,22 +115,23 @@ class Transformer(nn.Module):
         new_kv_cache = []
 
         if return_hidden_states:
-            hidden_states.append(x.detach())
+            hidden_states.append(x.detach())  # capture embedding before any layers
 
         for i, layer in enumerate(self.layers):
             layer_kv = kv_cache[i] if kv_cache is not None else None
             x, layer_new_kv, attn_w = layer(x, freqs_cis, mask, layer_kv, return_attention)
             new_kv_cache.append(layer_new_kv)
             if return_hidden_states:
-                hidden_states.append(x.detach())
+                hidden_states.append(x.detach())  # residual stream after this layer
             if return_attention and attn_w is not None:
                 attention_weights.append(attn_w.detach())
 
         x = self.final_norm(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x)  # (batch, seq_len, vocab_size)
 
         loss = None
         if targets is not None:
+            # shift: predict token[i+1] from token[i], so drop last logit and first target
             shift_logits = logits[:, :-1, :].contiguous()
             shift_targets = targets[:, 1:].contiguous()
             loss = F.cross_entropy(
@@ -151,19 +161,22 @@ class Transformer(nn.Module):
         """Autoregressive text generation with KV-cache."""
         self.eval()
 
+        # first pass: process the full prompt, populate the KV cache
         result = self(input_ids, kv_cache=None, start_pos=0)
         kv_cache = result["kv_cache"]
-        logits = result["logits"][:, -1, :]
+        logits = result["logits"][:, -1, :]  # only need the last position's logits
 
         generated = input_ids
 
         for i in range(max_new_tokens):
-            logits = logits / temperature
+            logits = logits / temperature  # higher temp = more random
 
+            # top-k: zero out everything except the k most likely tokens
             if top_k > 0:
                 top_k_values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < top_k_values[:, -1:]] = float("-inf")
 
+            # top-p (nucleus): zero out tokens until cumulative probability exceeds p
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -175,6 +188,7 @@ class Transformer(nn.Module):
             next_token = torch.multinomial(probs, num_samples=1)
             generated = torch.cat([generated, next_token], dim=1)
 
+            # subsequent passes: only feed the new token, reuse KV cache for the rest
             start_pos = generated.shape[1] - 1
             result = self(next_token, kv_cache=kv_cache, start_pos=start_pos)
             kv_cache = result["kv_cache"]
