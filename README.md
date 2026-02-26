@@ -154,7 +154,7 @@ python scripts/interpret.py \
 
 ## A note on how this was built
 
-The architecture decisions, interpretability experiments, and analysis in this README are mine. I used [Claude Code](https://claude.ai/claude-code) to help write training infrastructure and boilerplate (the trainer loop, data loading, config system) — the kind of code that's necessary but not where the interesting ideas live. Think of it the way you'd use a well-documented library to handle the scaffolding so you can focus on the actual research.
+The architecture decisions, interpretability experiments, and analysis in this README are mine. I used [Claude Code](https://claude.ai/claude-code) to help write training infrastructure and boilerplate (the trainer loop, data loading, config system) — the kind of code that's necessary but not where the interesting ideas live.
 
 ---
 
